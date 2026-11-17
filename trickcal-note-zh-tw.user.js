@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         트릭컬 노트 (Trickcal Note) 韓文轉繁體中文 (支援 AI/LLM + 術語表編輯)
 // @namespace    https://note.trickcal.com/
-// @version      2.3.0
+// @version      2.4.0
 // @description  將 트릭컬 노트 (note.trickcal.com) 韓文翻譯為繁體中文，支援 AI/LLM、側邊欄術語表、選詞加入術語表與排除不翻譯規則
 // @author       Antigravity
 // @match        https://note.trickcal.com/*
@@ -470,7 +470,7 @@
         const systemContent =
             (settings.systemPrompt || DEFAULT_SYSTEM_PROMPT) +
             glossaryInstruction +
-            '\n\n請將使用者提供的 JSON 物件中每個 value 的韓文翻譯為繁體中文，並只回傳一個合法的 JSON 物件，保留完全相同的 key，不要包含任何 Markdown 標記或額外文字。';
+            '\n\n請將使用者提供的 JSON 物件中每個 value 的韓文翻譯為繁體中文。若原文包含 {{0}}、{{1}} 等佔位符（代表動態數字或標籤），請務必完整保留並依照自然中文語序擺放。請只回傳一個合法的 JSON 物件，保留完全相同的 key，不要包含任何 Markdown 標記或額外文字。';
 
         try {
             const rawReply = await callLLMAPI([
@@ -626,27 +626,195 @@
         }
     }
 
+    const INLINE_TAGS = new Set(['SPAN', 'STRONG', 'B', 'EM', 'I', 'U', 'SMALL', 'MARK', 'A', 'CODE', 'IMG', 'SVG']);
+
+    function isInlineSentenceContainer(el) {
+        if (!el || el.nodeType !== Node.ELEMENT_NODE || isIgnoredElement(el)) return false;
+        if (el.childNodes.length < 2) return false;
+
+        let hasHangulText = false;
+        let hasPlaceholder = false;
+
+        for (const child of el.childNodes) {
+            if (child.nodeType === Node.TEXT_NODE) {
+                const orig = nodeOriginalText.has(child) ? nodeOriginalText.get(child) : child.nodeValue || '';
+                if (HANGUL_REGEX.test(orig)) {
+                    hasHangulText = true;
+                } else if (orig.trim()) {
+                    hasPlaceholder = true;
+                }
+            } else if (child.nodeType === Node.ELEMENT_NODE) {
+                if (!INLINE_TAGS.has(child.tagName) || isIgnoredElement(child)) return false;
+                if (child.tagName !== 'SVG' && child.childElementCount > 0) return false;
+                const txt = child.textContent || '';
+                if (HANGUL_REGEX.test(txt)) return false;
+                hasPlaceholder = true;
+            } else {
+                return false;
+            }
+        }
+        return hasHangulText && hasPlaceholder;
+    }
+
+    async function processInlineContainer(el, handledNodes) {
+        if (!isInlineSentenceContainer(el)) return false;
+
+        const segments = [];
+        const placeholders = [];
+
+        for (const child of el.childNodes) {
+            if (child.nodeType === Node.TEXT_NODE) {
+                if (!nodeOriginalText.has(child)) {
+                    nodeOriginalText.set(child, child.nodeValue);
+                    trackedNodes.add(child);
+                }
+                if (handledNodes) handledNodes.add(child);
+                const orig = nodeOriginalText.get(child);
+                if (HANGUL_REGEX.test(orig)) {
+                    segments.push({ type: 'text', node: child, orig });
+                } else if (orig.trim()) {
+                    const id = placeholders.length;
+                    const seg = { type: 'placeholder', kind: 'text', node: child, orig, id };
+                    placeholders.push(seg);
+                    segments.push(seg);
+                } else {
+                    segments.push({ type: 'ws', node: child, orig });
+                }
+            } else if (child.nodeType === Node.ELEMENT_NODE) {
+                const id = placeholders.length;
+                const seg = { type: 'placeholder', kind: 'el', node: child, id };
+                placeholders.push(seg);
+                segments.push(seg);
+            }
+        }
+
+        const template = segments
+            .map((s) => (s.type === 'placeholder' ? `{{${s.id}}}` : s.orig))
+            .join('');
+
+        const translated = await translateText(template);
+        if (!isEnabled || !el.isConnected || isPathExcluded()) return true;
+
+        // 確認所有佔位符皆完整保留，否則退回逐節點翻譯
+        for (const p of placeholders) {
+            if (!translated.includes(`{{${p.id}}}`)) {
+                for (const s of segments) {
+                    if (s.type === 'text') processTextNode(s.node);
+                }
+                return true;
+            }
+        }
+
+        const parts = translated.split(/(\{\{\d+\}\})/g);
+        isApplying = true;
+
+        // 先清空舊的 prefix/suffix 與韓文 Text 節點
+        for (const s of segments) {
+            if (s.type === 'text' || s.type === 'ws') {
+                s.node.nodeValue = '';
+            } else if (s.type === 'placeholder' && s.kind === 'el') {
+                s.node.removeAttribute('data-tr-prefix');
+                s.node.removeAttribute('data-tr-suffix');
+            } else if (s.type === 'placeholder' && s.kind === 'text') {
+                s.node.nodeValue = s.orig;
+            }
+        }
+
+        const textSlots = segments.filter((s) => s.type === 'text' || s.type === 'ws');
+        let textSlotIdx = 0;
+
+        for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
+            if (!part) continue;
+            const match = /^\{\{(\d+)\}\}$/.exec(part);
+            if (match) continue;
+
+            // 判斷這段文字緊鄰的前後佔位符
+            const prevMatch = i > 0 ? /^\{\{(\d+)\}\}$/.exec(parts[i - 1]) : null;
+            const nextMatch = i + 1 < parts.length ? /^\{\{(\d+)\}\}$/.exec(parts[i + 1]) : null;
+
+            if (nextMatch) {
+                const p = placeholders[Number(nextMatch[1])];
+                if (p.kind === 'text') {
+                    p.node.nodeValue = part + p.node.nodeValue;
+                    continue;
+                }
+                if (p.kind === 'el') {
+                    // 若前面有現成的 TextNode 可放，優先放進 TextNode，否則用 data-tr-prefix
+                    if (textSlotIdx < textSlots.length && p.node.previousSibling === textSlots[textSlotIdx].node) {
+                        textSlots[textSlotIdx++].node.nodeValue = part;
+                    } else {
+                        p.node.setAttribute('data-tr-prefix', (p.node.getAttribute('data-tr-prefix') || '') + part);
+                    }
+                    continue;
+                }
+            }
+
+            if (prevMatch) {
+                const p = placeholders[Number(prevMatch[1])];
+                if (p.kind === 'text') {
+                    p.node.nodeValue = p.node.nodeValue + part;
+                    continue;
+                }
+                if (p.kind === 'el') {
+                    if (textSlotIdx < textSlots.length) {
+                        textSlots[textSlotIdx++].node.nodeValue = part;
+                    } else {
+                        p.node.setAttribute('data-tr-suffix', (p.node.getAttribute('data-tr-suffix') || '') + part);
+                    }
+                    continue;
+                }
+            }
+
+            if (textSlotIdx < textSlots.length) {
+                textSlots[textSlotIdx++].node.nodeValue = part;
+            }
+        }
+
+        isApplying = false;
+        return true;
+    }
+
     function scanRoot(root) {
         if (!isEnabled || !root || isPathExcluded()) return;
 
         if (root.nodeType === Node.TEXT_NODE) {
-            processTextNode(root);
+            if (root.parentElement && isInlineSentenceContainer(root.parentElement)) {
+                processInlineContainer(root.parentElement);
+            } else {
+                processTextNode(root);
+            }
             return;
         }
 
         if (root.nodeType !== Node.ELEMENT_NODE && root !== document.body) return;
         if (root.nodeType === Node.ELEMENT_NODE && isIgnoredElement(root)) return;
 
+        const handledNodes = new WeakSet();
+
         if (root.nodeType === Node.ELEMENT_NODE) {
             processElementAttributes(root);
-            const elements = root.querySelectorAll('[placeholder], [title], [aria-label]');
-            for (const el of elements) {
+            const attrElements = root.querySelectorAll('[placeholder], [title], [aria-label]');
+            for (const el of attrElements) {
                 processElementAttributes(el);
+            }
+
+            if (isInlineSentenceContainer(root)) {
+                processInlineContainer(root, handledNodes);
+            }
+            const allElements = root.querySelectorAll('*');
+            for (const el of allElements) {
+                if (isInlineSentenceContainer(el)) {
+                    processInlineContainer(el, handledNodes);
+                }
             }
         }
 
         const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
             acceptNode(node) {
+                if (handledNodes.has(node)) {
+                    return NodeFilter.FILTER_REJECT;
+                }
                 if (!node.nodeValue || !HANGUL_REGEX.test(node.nodeValue)) {
                     return NodeFilter.FILTER_REJECT;
                 }
@@ -675,6 +843,8 @@
                 node.nodeValue = orig;
             }
         }
+        document.querySelectorAll('[data-tr-prefix]').forEach((el) => el.removeAttribute('data-tr-prefix'));
+        document.querySelectorAll('[data-tr-suffix]').forEach((el) => el.removeAttribute('data-tr-suffix'));
         for (const attr of TRANSLATABLE_ATTRS) {
             const origAttrKey = `data-tr-orig-${attr}`;
             document.querySelectorAll(`[${origAttrKey}]`).forEach((el) => {
@@ -906,6 +1076,8 @@
             }
             .tr-status-msg.ok { display: block; background: rgba(34, 197, 94, 0.15); color: #4ade80; }
             .tr-status-msg.err { display: block; background: rgba(239, 68, 68, 0.15); color: #f87171; }
+            [data-tr-prefix]::before { content: attr(data-tr-prefix); }
+            [data-tr-suffix]::after { content: attr(data-tr-suffix); }
 
             #trickcal-tr-selection-pop {
                 position: fixed;
