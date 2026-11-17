@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         트릭컬 노트 (Trickcal Note) 韓文轉繁體中文 (支援 AI/LLM + 術語表編輯)
 // @namespace    https://note.trickcal.com/
-// @version      2.1.0
-// @description  將 트릭컬 노트 (note.trickcal.com) 韓文翻譯為繁體中文，支援自訂 API 接入 AI/LLM 翻譯、側邊欄術語表編輯與快取
+// @version      2.2.0
+// @description  將 트릭컬 노트 (note.trickcal.com) 韓文翻譯為繁體中文，支援 AI/LLM、側邊欄術語表、選詞加入術語表與排除不翻譯規則
 // @author       Antigravity
 // @match        https://note.trickcal.com/*
 // @grant        GM_xmlhttpRequest
@@ -26,6 +26,7 @@
         ENABLED: 'trickcal_note_zh_tw_enabled',
         GLOSSARY: 'trickcal_note_zh_tw_glossary_v1',
         SETTINGS: 'trickcal_note_zh_tw_ai_settings_v1',
+        EXCLUDES: 'trickcal_note_zh_tw_excludes_v1',
     };
 
     const DEFAULT_GLOSSARY = {
@@ -78,6 +79,7 @@
     let isEnabled = GM_getValue(STORAGE_KEYS.ENABLED, true);
     let settings = Object.assign({}, DEFAULT_SETTINGS, GM_getValue(STORAGE_KEYS.SETTINGS, {}));
     let glossary = Object.assign({}, DEFAULT_GLOSSARY, GM_getValue(STORAGE_KEYS.GLOSSARY, {}));
+    let excludes = Object.assign({ paths: [], selectors: [] }, GM_getValue(STORAGE_KEYS.EXCLUDES, {}));
     const cache = new Map(Object.entries(GM_getValue(STORAGE_KEYS.CACHE, {})));
 
     const pendingTranslations = new Map(); // trimmedText -> Promise<string>
@@ -112,6 +114,18 @@
 
     function saveSettings() {
         GM_setValue(STORAGE_KEYS.SETTINGS, settings);
+    }
+
+    function saveExcludes() {
+        GM_setValue(STORAGE_KEYS.EXCLUDES, excludes);
+    }
+
+    function isPathExcluded() {
+        const currentPath = location.pathname;
+        return (excludes.paths || []).some((p) => {
+            const rule = p.trim();
+            return rule && (currentPath === rule || currentPath.startsWith(rule));
+        });
     }
 
     // --- Google 翻譯佇列 ---
@@ -362,13 +376,24 @@
         if (
             el.id === 'trickcal-tr-panel' ||
             el.id === 'trickcal-tr-drawer' ||
+            el.id === 'trickcal-tr-selection-pop' ||
             el.closest('#trickcal-tr-panel') ||
-            el.closest('#trickcal-tr-drawer')
+            el.closest('#trickcal-tr-drawer') ||
+            el.closest('#trickcal-tr-selection-pop')
         ) {
             return true;
         }
         if (IGNORE_TAGS.has(el.tagName)) return true;
         if (el.isContentEditable) return true;
+        for (const sel of excludes.selectors || []) {
+            const s = sel.trim();
+            if (!s) continue;
+            try {
+                if (el.matches(s) || el.closest(s)) return true;
+            } catch (_) {
+                // 忽略無效的 CSS 選擇器
+            }
+        }
         return false;
     }
 
@@ -388,7 +413,7 @@
         const original = nodeOriginalText.get(node);
         const translated = await translateText(original);
 
-        if (!isEnabled || !node.isConnected) return;
+        if (!isEnabled || !node.isConnected || isPathExcluded()) return;
         if (node.nodeValue !== translated) {
             isApplying = true;
             node.nodeValue = translated;
@@ -408,7 +433,7 @@
             }
             const original = el.getAttribute(origAttrKey);
             const translated = await translateText(original);
-            if (!isEnabled || !el.isConnected) return;
+            if (!isEnabled || !el.isConnected || isPathExcluded()) return;
             if (el.getAttribute(attr) !== translated) {
                 isApplying = true;
                 el.setAttribute(attr, translated);
@@ -418,7 +443,7 @@
     }
 
     function scanRoot(root) {
-        if (!isEnabled || !root) return;
+        if (!isEnabled || !root || isPathExcluded()) return;
 
         if (root.nodeType === Node.TEXT_NODE) {
             processTextNode(root);
@@ -697,6 +722,34 @@
             }
             .tr-status-msg.ok { display: block; background: rgba(34, 197, 94, 0.15); color: #4ade80; }
             .tr-status-msg.err { display: block; background: rgba(239, 68, 68, 0.15); color: #f87171; }
+
+            #trickcal-tr-selection-pop {
+                position: fixed;
+                z-index: 999998;
+                display: none;
+                align-items: center;
+                gap: 4px;
+                background: rgba(24, 24, 27, 0.95);
+                border: 1px solid #3f3f46;
+                padding: 4px 6px;
+                border-radius: 8px;
+                box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+                backdrop-filter: blur(6px);
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            }
+            #trickcal-tr-selection-pop button {
+                border: none;
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-size: 12px;
+                font-weight: 500;
+                cursor: pointer;
+                color: #fff;
+                white-space: nowrap;
+            }
+            #trickcal-tr-selection-pop button:hover { opacity: 0.9; }
+            #tr-sel-add-glossary { background: #3b82f6; }
+            #tr-sel-exclude-el { background: #52525b; color: #f4f4f5; }
         `);
     }
 
@@ -710,7 +763,8 @@
             </div>
             <div class="tr-tabs">
                 <button class="tr-tab active" data-tab="ai">AI / 翻譯引擎</button>
-                <button class="tr-tab" data-tab="glossary">術語表編輯 (<span id="tr-glossary-count">0</span>)</button>
+                <button class="tr-tab" data-tab="glossary">術語表 (<span id="tr-glossary-count">0</span>)</button>
+                <button class="tr-tab" data-tab="exclude">排除規則</button>
             </div>
             <div class="tr-drawer-body">
                 <!-- Tab 1: AI 設定 -->
@@ -787,6 +841,27 @@
                         <button type="button" class="tr-btn tr-btn-danger tr-btn-sm" id="tr-reset-glossary">重置預設</button>
                     </div>
                     <div class="tr-status-msg" id="tr-glossary-status"></div>
+                </div>
+
+                <!-- Tab 3: 排除規則 -->
+                <div class="tr-tab-pane" id="tr-pane-exclude">
+                    <div class="tr-field">
+                        <label>不翻譯的網址路徑（每行一條，例如 /leaderboard）</label>
+                        <textarea class="tr-textarea" id="tr-exclude-paths" placeholder="/leaderboard"></textarea>
+                        <div class="tr-row">
+                            <button type="button" class="tr-btn tr-btn-secondary tr-btn-sm" id="tr-add-current-path">+ 排除目前頁面</button>
+                        </div>
+                    </div>
+
+                    <div class="tr-field">
+                        <label>不翻譯的 CSS 選擇器（每行一條，可用選取文字「🚫 不翻譯此類」自動加入）</label>
+                        <textarea class="tr-textarea" id="tr-exclude-selectors" style="min-height:110px;" placeholder="例如：&#10;table td:nth-child(2)&#10;.nickname"></textarea>
+                    </div>
+
+                    <div class="tr-row">
+                        <button type="button" class="tr-btn tr-btn-success" id="tr-save-excludes">儲存排除規則並套用</button>
+                    </div>
+                    <div class="tr-status-msg" id="tr-exclude-status"></div>
                 </div>
             </div>
         `;
@@ -1110,8 +1185,179 @@
             showGlossaryStatus('已重置為預設術語表', true);
         });
 
+        // --- 排除規則邏輯 ---
+        const excludePathsInput = drawer.querySelector('#tr-exclude-paths');
+        const excludeSelectorsInput = drawer.querySelector('#tr-exclude-selectors');
+        const excludeStatus = drawer.querySelector('#tr-exclude-status');
+
+        function syncExcludeInputs() {
+            excludePathsInput.value = (excludes.paths || []).join('\n');
+            excludeSelectorsInput.value = (excludes.selectors || []).join('\n');
+        }
+
+        function showExcludeStatus(msg, ok = true) {
+            excludeStatus.textContent = msg;
+            excludeStatus.className = `tr-status-msg ${ok ? 'ok' : 'err'}`;
+            setTimeout(() => {
+                excludeStatus.style.display = '';
+                excludeStatus.className = 'tr-status-msg';
+            }, 3000);
+        }
+
+        drawer.querySelector('#tr-add-current-path').addEventListener('click', () => {
+            const p = location.pathname;
+            if (!excludes.paths.includes(p)) {
+                excludes.paths.push(p);
+                syncExcludeInputs();
+            }
+        });
+
+        drawer.querySelector('#tr-save-excludes').addEventListener('click', () => {
+            excludes.paths = excludePathsInput.value
+                .split('\n')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            excludes.selectors = excludeSelectorsInput.value
+                .split('\n')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            saveExcludes();
+            retranslatePage();
+            showExcludeStatus('排除規則已儲存並套用！', true);
+        });
+
+        drawer._openTab = (tabName) => {
+            drawer.classList.add('open');
+            drawer.querySelectorAll('.tr-tab').forEach((t) => {
+                t.classList.toggle('active', t.dataset.tab === tabName);
+            });
+            drawer.querySelectorAll('.tr-tab-pane').forEach((p) => {
+                p.classList.toggle('active', p.id === `tr-pane-${tabName}`);
+            });
+        };
+        drawer._syncExcludeInputs = syncExcludeInputs;
+
+        syncExcludeInputs();
         renderGlossary();
         return drawer;
+    }
+
+    // --- 選取文字懸浮按鈕（加入術語表 / 排除不翻譯） ---
+    function deriveElementSelector(el) {
+        if (!el || el === document.body) return '';
+        const td = el.closest('td, th');
+        if (td && td.parentElement) {
+            const idx = Array.from(td.parentElement.children).indexOf(td) + 1;
+            const table = td.closest('table');
+            if (table && table.classList.length > 0) {
+                const cls = Array.from(table.classList)
+                    .filter((c) => /^[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(c))
+                    .slice(0, 2)
+                    .map((c) => `.${CSS.escape(c)}`)
+                    .join('');
+                if (cls) return `table${cls} ${td.tagName.toLowerCase()}:nth-child(${idx})`;
+            }
+            return `table ${td.tagName.toLowerCase()}:nth-child(${idx})`;
+        }
+
+        const classes = Array.from(el.classList || [])
+            .filter((c) => /^[a-zA-Z_-][a-zA-Z0-9_-]{2,}$/.test(c))
+            .slice(0, 2);
+        if (classes.length > 0) {
+            return `${el.tagName.toLowerCase()}.${classes.map((c) => CSS.escape(c)).join('.')}`;
+        }
+        return el.tagName.toLowerCase();
+    }
+
+    function setupSelectionPopup(drawer) {
+        const pop = document.createElement('div');
+        pop.id = 'trickcal-tr-selection-pop';
+        pop.innerHTML = `
+            <button type="button" id="tr-sel-add-glossary">+ 加入術語表</button>
+            <button type="button" id="tr-sel-exclude-el" title="將此類元素加入不翻譯清單">🚫 不翻譯此類</button>
+        `;
+        document.body.appendChild(pop);
+
+        let lastSelectionInfo = null;
+
+        function hidePop() {
+            pop.style.display = 'none';
+            lastSelectionInfo = null;
+        }
+
+        document.addEventListener('mouseup', (e) => {
+            if (e.target.closest('#trickcal-tr-selection-pop') || e.target.closest('#trickcal-tr-drawer') || e.target.closest('#trickcal-tr-panel')) {
+                return;
+            }
+            setTimeout(() => {
+                const sel = window.getSelection();
+                const text = sel ? sel.toString().trim() : '';
+                if (!text || text.length > 80 || sel.rangeCount === 0) {
+                    hidePop();
+                    return;
+                }
+                const range = sel.getRangeAt(0);
+                const container = range.commonAncestorContainer;
+                const el = container.nodeType === Node.TEXT_NODE ? container.parentElement : container;
+                if (!el || IGNORE_TAGS.has(el.tagName) || el.isContentEditable) {
+                    hidePop();
+                    return;
+                }
+
+                const anchorNode = sel.anchorNode;
+                const origNodeText = anchorNode && nodeOriginalText.has(anchorNode) ? nodeOriginalText.get(anchorNode).trim() : '';
+
+                lastSelectionInfo = {
+                    selectedText: text,
+                    origNodeText,
+                    element: el,
+                };
+
+                const rect = range.getBoundingClientRect();
+                const top = Math.max(8, rect.top - 38);
+                const left = Math.min(window.innerWidth - 210, Math.max(8, rect.left));
+                pop.style.top = `${top}px`;
+                pop.style.left = `${left}px`;
+                pop.style.display = 'flex';
+            }, 10);
+        });
+
+        document.addEventListener('mousedown', (e) => {
+            if (!e.target.closest('#trickcal-tr-selection-pop')) {
+                hidePop();
+            }
+        });
+
+        pop.querySelector('#tr-sel-add-glossary').addEventListener('click', () => {
+            if (!lastSelectionInfo) return;
+            const { selectedText, origNodeText } = lastSelectionInfo;
+            const koInput = drawer.querySelector('#tr-new-ko');
+            const zhInput = drawer.querySelector('#tr-new-zh');
+
+            drawer._openTab('glossary');
+            if (HANGUL_REGEX.test(selectedText)) {
+                koInput.value = selectedText;
+                zhInput.value = '';
+                zhInput.focus();
+            } else {
+                koInput.value = origNodeText || '';
+                zhInput.value = selectedText;
+                (koInput.value ? zhInput : koInput).focus();
+            }
+            hidePop();
+        });
+
+        pop.querySelector('#tr-sel-exclude-el').addEventListener('click', () => {
+            if (!lastSelectionInfo) return;
+            const selector = deriveElementSelector(lastSelectionInfo.element);
+            if (selector && !excludes.selectors.includes(selector)) {
+                excludes.selectors.push(selector);
+                saveExcludes();
+                drawer._syncExcludeInputs();
+                retranslatePage();
+            }
+            hidePop();
+        });
     }
 
     function createControlPanel(drawer) {
@@ -1168,6 +1414,31 @@
         injectStyles();
         const drawer = createDrawer();
         createControlPanel(drawer);
+        setupSelectionPopup(drawer);
+
+        // 監聽 SPA 路由切換
+        let lastPath = location.pathname;
+        const onRouteChange = () => {
+            if (location.pathname !== lastPath) {
+                lastPath = location.pathname;
+                if (isPathExcluded()) {
+                    restoreOriginals();
+                } else if (isEnabled) {
+                    scheduleFullScan();
+                }
+            }
+        };
+        const origPush = history.pushState;
+        const origReplace = history.replaceState;
+        history.pushState = function (...args) {
+            origPush.apply(this, args);
+            onRouteChange();
+        };
+        history.replaceState = function (...args) {
+            origReplace.apply(this, args);
+            onRouteChange();
+        };
+        window.addEventListener('popstate', onRouteChange);
 
         observer.observe(document.body, {
             childList: true,
@@ -1177,7 +1448,7 @@
             attributeFilter: TRANSLATABLE_ATTRS,
         });
 
-        if (isEnabled) {
+        if (isEnabled && !isPathExcluded()) {
             scanRoot(document.body);
         }
     }
