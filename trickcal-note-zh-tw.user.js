@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         트릭컬 노트 (Trickcal Note) 韓文轉繁體中文 (支援 AI/LLM + 術語表編輯)
 // @namespace    https://note.trickcal.com/
-// @version      2.2.0
+// @version      2.2.1
 // @description  將 트릭컬 노트 (note.trickcal.com) 韓文翻譯為繁體中文，支援 AI/LLM、側邊欄術語表、選詞加入術語表與排除不翻譯規則
 // @author       Antigravity
 // @match        https://note.trickcal.com/*
@@ -385,6 +385,13 @@
         }
         if (IGNORE_TAGS.has(el.tagName)) return true;
         if (el.isContentEditable) return true;
+        // 排行榜 (/leaderboard) 的玩家暱稱不翻譯（避免誤譯玩家 ID）
+        if (location.pathname.startsWith('/leaderboard')) {
+            const nickEl = el.closest('div.truncate.text-sm');
+            if (nickEl && nickEl.querySelector('span.opacity-60')) {
+                return true;
+            }
+        }
         for (const sel of excludes.selectors || []) {
             const s = sel.trim();
             if (!s) continue;
